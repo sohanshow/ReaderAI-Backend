@@ -1,0 +1,42 @@
+{
+  // Specifies that we're using the TypeScript ESLint parser
+  "parser": "@typescript-eslint/parser",
+
+  // Parser options for TypeScript
+  "parserOptions": {
+    // Points to your tsconfig.json file
+    "project": "tsconfig.json",
+    // Allows the use of imports
+    "sourceType": "module"
+  },
+
+  // Uses the recommended TypeScript ESLint plugin
+  "plugins": ["@typescript-eslint/eslint-plugin"],
+
+  // Extends the recommended rules for TypeScript
+  "extends": ["plugin:@typescript-eslint/recommended"],
+
+  // Specifies this as the root configuration file
+  "root": true,
+
+  // Environment settings
+  "env": {
+    "node": true, // Enables Node.js global variables
+    "jest": true // Enables Jest global variables for testing
+  },
+
+  // Specific rule configurations
+  "rules": {
+    // Allows interfaces without the "I" prefix
+    "@typescript-eslint/interface-name-prefix": "off",
+
+    // Doesn't require explicit return types on functions
+    "@typescript-eslint/explicit-function-return-type": "off",
+
+    // Doesn't require explicit return types on exported functions
+    "@typescript-eslint/explicit-module-boundary-types": "off",
+
+    // Allows the use of the 'any' type
+    "@typescript-eslint/no-explicit-any": "off"
+  }
+}
