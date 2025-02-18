@@ -9,18 +9,18 @@ export class PlayHTService {
   async initiateAudioGeneration(
     text: string,
     voiceId: string,
-    temperature: Number,
-    speed: Number,
+    temperature: number,
+    speed: number,
   ): Promise<string> {
     try {
       const response = await axios.post(
         this.API_URL,
         {
-          model: 'PlayDialog',
+          model: 'Play3.0-mini',
           text,
           voice: voiceId,
-          speed,
           temperature,
+          speed,
         },
         {
           headers: {
@@ -51,14 +51,10 @@ export class PlayHTService {
         },
       });
 
-      if (response.data.output.status === 'COMPLETED') {
-        return {
-          status: 'completed',
-          url: response.data.output.url,
-        };
-      }
-
-      return { status: 'processing' };
+      return {
+        status: response.data.output.status,
+        url: response.data.output.url,
+      };
     } catch (error) {
       this.logger.error(`Failed to check job status: ${error.message}`);
       throw error;
