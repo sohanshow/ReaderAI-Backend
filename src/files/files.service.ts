@@ -19,9 +19,10 @@ import {
 @Injectable()
 export class FilesService {
   private readonly logger = new Logger(FilesService.name);
-  private readonly jobPollingInterval = 2000; // 2 seconds
-  private readonly blobServiceClient: BlobServiceClient;
+  private readonly jobPollingInterval = 2000;
   private readonly containerName = 'pdf-files';
+  private readonly blobServiceClient: BlobServiceClient;
+  private activeJobs: Map<string, Set<string>> = new Map(); // fileId -> Set of jobIds
 
   constructor(
     @InjectModel(FileData.name) private fileDataModel: Model<FileData>,
@@ -31,7 +32,6 @@ export class FilesService {
     this.blobServiceClient = BlobServiceClient.fromConnectionString(
       process.env.AZURE_CONTAINER_CONNECTION_STRING,
     );
-    // Call the setup function when service initializes
     this.setupBlobStorageCors().catch((err) =>
       console.error('Failed to setup blob storage CORS:', err),
     );
@@ -78,8 +78,8 @@ export class FilesService {
     fileId: string,
     userEmail: string,
     voiceId: string,
-    temperature: Number,
-    speed: Number,
+    temperature: number,
+    speed: number,
   ) {
     try {
       const filePath = await this.uploadToAzureStorage(file, fileId);
@@ -87,59 +87,47 @@ export class FilesService {
       const pages = pdfData.text.split('\n\n').filter((page) => page.trim());
       const totalPages = pages.length;
 
+      // Initialize jobs tracking
+      this.activeJobs.set(fileId, new Set());
+
       // Initialize file with pages
       await this.fileDataModel.findByIdAndUpdate(fileId, {
         totalPages,
         processedPages: 0,
+        filePath,
         pages: Array.from({ length: totalPages }, (_, i) => ({
           pageNumber: i + 1,
           textExtractionStatus: 'pending',
           audioGenerationStatus: 'pending',
-          jobId: null,
         })),
       });
 
-      // Process each page
-      for (let i = 0; i < totalPages; i++) {
-        const pageNumber = i + 1;
-        const text = pages[i].trim();
-
+      // Process all pages in parallel
+      const jobPromises = pages.map(async (text, index) => {
+        const pageNumber = index + 1;
         try {
-          // Emit start of extraction
-          this.pdfGateway.emitProgress(userEmail, fileId, {
-            phase: 'extraction',
-            current: pageNumber - 1,
-            total: totalPages,
-            pageNumber,
-          });
-
           // Update text extraction status
           await this.fileDataModel.updateOne(
             { _id: fileId, 'pages.pageNumber': pageNumber },
             {
               $set: {
-                'pages.$.text': text,
+                'pages.$.text': text.trim(),
                 'pages.$.textExtractionStatus': 'completed',
                 'pages.$.audioGenerationStatus': 'processing',
               },
             },
           );
 
-          // Emit completion of extraction for this page
-          this.pdfGateway.emitProgress(userEmail, fileId, {
-            phase: 'extraction',
-            current: pageNumber,
-            total: totalPages,
-            pageNumber,
-          });
-
           // Initiate audio generation
           const jobId = await this.playHTService.initiateAudioGeneration(
-            text,
+            text.trim(),
             voiceId,
             temperature,
             speed,
           );
+
+          // Add job to tracking
+          this.activeJobs.get(fileId).add(jobId);
 
           // Update job ID
           await this.fileDataModel.updateOne(
@@ -151,131 +139,92 @@ export class FilesService {
             },
           );
 
-          // Start polling for job status
-          await this.pollJobStatus(
-            jobId,
-            fileId,
-            userEmail,
-            pageNumber,
-            totalPages,
-          );
+          return { pageNumber, jobId };
         } catch (error) {
           this.logger.error(
             `Error processing page ${pageNumber} of file ${fileId}:`,
             error.stack,
           );
-
-          await this.fileDataModel.updateOne(
-            { _id: fileId, 'pages.pageNumber': pageNumber },
-            {
-              $set: {
-                'pages.$.textExtractionStatus': 'failed',
-                'pages.$.audioGenerationStatus': 'failed',
-                'pages.$.error': error.message,
-              },
-            },
-          );
-
-          // Emit error progress
-          this.pdfGateway.emitProgress(userEmail, fileId, {
-            phase: 'extraction',
-            current: pageNumber,
-            total: totalPages,
-            pageNumber,
-          });
+          throw error;
         }
-      }
+      });
 
-      this.logger.log(`Successfully initiated processing for file ${fileId}`);
+      // Wait for all jobs to be initiated
+      const jobs = await Promise.all(jobPromises);
+
+      // Start polling all jobs
+      this.pollAllJobs(fileId, userEmail, jobs);
     } catch (error) {
       this.logger.error(`Failed to process file ${fileId}:`, error.stack);
       throw error;
     }
   }
 
-  private async pollJobStatus(
-    jobId: string,
+  private async pollAllJobs(
     fileId: string,
     userEmail: string,
-    pageNumber: number,
-    totalPages: number,
+    jobs: { pageNumber: number; jobId: string }[],
   ) {
-    try {
-      while (true) {
-        const { status, url } = await this.playHTService.checkJobStatus(jobId);
+    const completedJobs = new Set<string>();
+    const totalJobs = jobs.length;
 
-        // Emit audio generation progress
-        this.pdfGateway.emitProgress(userEmail, fileId, {
-          phase: 'audio',
-          current: pageNumber - 1,
-          total: totalPages,
-          pageNumber,
+    const poll = async () => {
+      if (completedJobs.size === totalJobs) {
+        this.activeJobs.delete(fileId);
+        await this.fileDataModel.findByIdAndUpdate(fileId, {
+          processingComplete: true,
         });
-
-        if (status === 'completed' && url) {
-          await this.fileDataModel.updateOne(
-            { _id: fileId, 'pages.pageNumber': pageNumber },
-            {
-              $set: {
-                'pages.$.audioUrl': url,
-                'pages.$.audioGenerationStatus': 'completed',
-              },
-              $inc: { processedPages: 1 },
-            },
-          );
-
-          // Emit completion of audio generation for this page
-          this.pdfGateway.emitProgress(userEmail, fileId, {
-            phase: 'audio',
-            current: pageNumber,
-            total: totalPages,
-            pageNumber,
-          });
-
-          // Check if all pages are processed
-          const file = await this.fileDataModel.findById(fileId);
-          if (file.processedPages === file.totalPages) {
-            await this.fileDataModel.findByIdAndUpdate(fileId, {
-              processingComplete: true,
-            });
-          }
-
-          break;
-        }
-
-        await new Promise((resolve) =>
-          setTimeout(resolve, this.jobPollingInterval),
-        );
+        return;
       }
-    } catch (error) {
-      this.logger.error(
-        `Error polling job status for page ${pageNumber} of file ${fileId}:`,
-        error.stack,
+
+      const pendingJobs = jobs.filter((job) => !completedJobs.has(job.jobId));
+
+      await Promise.all(
+        pendingJobs.map(async (job) => {
+          try {
+            const { status, url } = await this.playHTService.checkJobStatus(
+              job.jobId,
+            );
+
+            if (status === 'COMPLETED' && url) {
+              completedJobs.add(job.jobId);
+
+              await this.fileDataModel.updateOne(
+                { _id: fileId, 'pages.pageNumber': job.pageNumber },
+                {
+                  $set: {
+                    'pages.$.audioUrl': url,
+                    'pages.$.audioGenerationStatus': 'completed',
+                  },
+                  $inc: { processedPages: 1 },
+                },
+              );
+
+              // Emit progress update
+              this.pdfGateway.emitProgress(userEmail, fileId, {
+                phase: 'audio',
+                completedPages: completedJobs.size,
+                totalPages: totalJobs,
+                completedJobs: Array.from(completedJobs),
+              });
+            }
+          } catch (error) {
+            this.logger.error(
+              `Error polling job ${job.jobId} for page ${job.pageNumber}:`,
+              error.stack,
+            );
+          }
+        }),
       );
 
-      await this.fileDataModel.updateOne(
-        { _id: fileId, 'pages.pageNumber': pageNumber },
-        {
-          $set: {
-            'pages.$.audioGenerationStatus': 'failed',
-            'pages.$.error': error.message,
-          },
-        },
-      );
+      // Continue polling if there are still pending jobs
+      if (completedJobs.size < totalJobs) {
+        setTimeout(poll, this.jobPollingInterval);
+      }
+    };
 
-      // Emit error progress
-      this.pdfGateway.emitProgress(userEmail, fileId, {
-        phase: 'audio',
-        current: pageNumber,
-        total: totalPages,
-        pageNumber,
-      });
-    }
-  }
-
-  private async getTotalPages(fileId: string): Promise<number> {
-    const file = await this.fileDataModel.findById(fileId);
-    return file.totalPages;
+    // Start polling
+    poll();
   }
 
   async uploadFile(
@@ -294,13 +243,11 @@ export class FilesService {
     }
 
     try {
-      // Generate a unique file ID
       const fileId = new mongoose.Types.ObjectId().toString();
 
-      // Upload the file to Azure Blob Storage
+      // Upload to Azure first
       const filePath = await this.uploadToAzureStorage(file, fileId);
 
-      // Create the FileData document with the filePath
       const fileData = new this.fileDataModel({
         _id: fileId,
         userEmail,
@@ -310,12 +257,11 @@ export class FilesService {
         selectedVoice: voiceId,
         temperature,
         speed,
-        filePath,
+        filePath, // Now we have the actual filePath
         pages: [],
         processingComplete: false,
       });
 
-      // Save the FileData document
       const savedFile = await fileData.save();
 
       // Start processing in background
@@ -375,138 +321,18 @@ export class FilesService {
       throw new NotFoundException('File not found');
     }
 
-    return { message: 'File deleted successfully' };
-  }
-
-  async retryFailedPage(fileId: string, pageNumber: number, userEmail: string) {
-    const file = await this.fileDataModel.findOne({
-      _id: fileId,
-      userEmail,
-    });
-
-    if (!file) {
-      throw new NotFoundException('File not found');
-    }
-
-    const page = file.pages.find((p) => p.pageNumber === pageNumber);
-    if (!page) {
-      throw new NotFoundException('Page not found');
-    }
-
-    if (page.audioGenerationStatus !== 'failed') {
-      throw new BadRequestException('Page is not in failed state');
-    }
-
-    // Reset page status
-    await this.fileDataModel.updateOne(
-      { _id: fileId, 'pages.pageNumber': pageNumber },
-      {
-        $set: {
-          'pages.$.audioGenerationStatus': 'processing',
-          'pages.$.error': null,
-        },
-      },
-    );
-
-    // Emit progress update for retry initiation
-    this.pdfGateway.emitProgress(userEmail, fileId, {
-      phase: 'audio',
-      current: pageNumber - 1,
-      total: file.totalPages,
-      pageNumber,
-    });
-
+    // Clean up from Azure storage
     try {
-      // Retry audio generation
-      const jobId = await this.playHTService.initiateAudioGeneration(
-        page.text,
-        file.selectedVoice,
-        file.temperature,
-        file.speed,
+      const containerClient = this.blobServiceClient.getContainerClient(
+        this.containerName,
       );
-
-      await this.fileDataModel.updateOne(
-        { _id: fileId, 'pages.pageNumber': pageNumber },
-        {
-          $set: {
-            'pages.$.jobId': jobId,
-          },
-        },
-      );
-
-      // Start polling for job status with total pages
-      this.pollJobStatus(jobId, fileId, userEmail, pageNumber, file.totalPages);
-
-      this.logger.log(`Retry initiated for file ${fileId}, page ${pageNumber}`);
-
-      return { message: 'Retry initiated successfully' };
+      const blobName = `${id}.pdf`;
+      await containerClient.deleteBlob(blobName);
     } catch (error) {
-      this.logger.error(
-        `Retry failed for file ${fileId}, page ${pageNumber}:`,
-        error.stack,
-      );
-
-      await this.fileDataModel.updateOne(
-        { _id: fileId, 'pages.pageNumber': pageNumber },
-        {
-          $set: {
-            'pages.$.audioGenerationStatus': 'failed',
-            'pages.$.error': error.message,
-          },
-        },
-      );
-
-      // Emit error progress
-      this.pdfGateway.emitProgress(userEmail, fileId, {
-        phase: 'audio',
-        current: pageNumber - 1,
-        total: file.totalPages,
-        pageNumber,
-      });
-
-      throw error;
-    }
-  }
-
-  async getFileProgress(fileId: string, userEmail: string) {
-    const file = await this.fileDataModel
-      .findOne({ _id: fileId, userEmail })
-      .select('totalPages processedPages processingComplete pages')
-      .exec();
-
-    if (!file) {
-      throw new NotFoundException('File not found');
+      this.logger.error(`Failed to delete blob for file ${id}:`, error);
     }
 
-    const pagesStatus = file.pages.map((page) => ({
-      pageNumber: page.pageNumber,
-      textExtractionStatus: page.textExtractionStatus,
-      audioGenerationStatus: page.audioGenerationStatus,
-      error: page.error,
-    }));
-
-    return {
-      totalPages: file.totalPages,
-      processedPages: file.processedPages,
-      processingComplete: file.processingComplete,
-      pagesStatus,
-    };
-  }
-
-  async checkProcessingStatus(fileId: string, userEmail: string) {
-    const file = await this.fileDataModel
-      .findOne({ _id: fileId, userEmail })
-      .select('processingComplete processedPages totalPages')
-      .exec();
-
-    if (!file) {
-      throw new NotFoundException('File not found');
-    }
-
-    return {
-      processingComplete: file.processingComplete,
-      progress: (file.processedPages / file.totalPages) * 100,
-    };
+    return { message: 'File deleted successfully' };
   }
 
   async generateViewUrl(
@@ -537,5 +363,21 @@ export class FilesService {
     });
 
     return { url: sasUrl };
+  }
+
+  async checkProcessingStatus(fileId: string, userEmail: string) {
+    const file = await this.fileDataModel
+      .findOne({ _id: fileId, userEmail })
+      .select('processingComplete processedPages totalPages')
+      .exec();
+
+    if (!file) {
+      throw new NotFoundException('File not found');
+    }
+
+    return {
+      processingComplete: file.processingComplete,
+      progress: (file.processedPages / file.totalPages) * 100,
+    };
   }
 }

@@ -31,31 +31,12 @@ export class PdfGateway implements OnGatewayConnection, OnGatewayDisconnect {
     fileId: string,
     progress: {
       phase: 'extraction' | 'audio';
-      current: number;
-      total: number;
-      pageNumber?: number;
+      completedPages: number;
+      totalPages: number;
+      completedJobs: string[];
     },
   ) {
     const channel = `pdf-progress-${userEmail}-${fileId}`;
-    // this.logger.log(`Emitting progress on channel ${channel}:`, progress);
     this.server.emit(channel, progress);
-  }
-
-  emitJobStatus(
-    userEmail: string,
-    fileId: string,
-    pageNumber: number,
-    status: string,
-  ) {
-    const channel = `pdf-progress-${userEmail}-${fileId}`;
-    this.logger.log(`Emitting job status on channel ${channel}:`, {
-      pageNumber,
-      status,
-    });
-    this.server.emit(channel, {
-      phase: 'audio',
-      pageNumber,
-      status,
-    });
   }
 }
