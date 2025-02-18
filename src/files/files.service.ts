@@ -170,9 +170,18 @@ export class FilesService {
 
     const poll = async () => {
       if (completedJobs.size === totalJobs) {
+        // Clean up tracking and mark file as complete
         this.activeJobs.delete(fileId);
         await this.fileDataModel.findByIdAndUpdate(fileId, {
           processingComplete: true,
+        });
+
+        // Emit final completion status
+        this.pdfGateway.emitProgress(userEmail, fileId, {
+          phase: null, // Indicates processing is complete
+          completedPages: totalJobs,
+          totalPages: totalJobs,
+          completedJobs: Array.from(completedJobs),
         });
         return;
       }
@@ -207,6 +216,24 @@ export class FilesService {
                 totalPages: totalJobs,
                 completedJobs: Array.from(completedJobs),
               });
+
+              // Check if this was the last job
+              if (completedJobs.size === totalJobs) {
+                // Mark file as complete and emit final status
+                await this.fileDataModel.findByIdAndUpdate(fileId, {
+                  processingComplete: true,
+                });
+
+                this.pdfGateway.emitProgress(userEmail, fileId, {
+                  phase: null,
+                  completedPages: totalJobs,
+                  totalPages: totalJobs,
+                  completedJobs: Array.from(completedJobs),
+                });
+
+                this.activeJobs.delete(fileId);
+                return;
+              }
             }
           } catch (error) {
             this.logger.error(
