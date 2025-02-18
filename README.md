@@ -82,6 +82,12 @@ AZURE_CONTAINER_CONNECTION_STRING=
 npm run start:debug
 ```
 
+## Optimization 1 Pushed:
+
+- Updated endpoint to use PlayMini instead of PlayDialogue.
+- Added parallel processing of pdf page audio generation and then websocket collection.
+- Optimized time taken to generate audio for pages by more than 50%.
+
 ## 📁 Project Structure
 
 ```
